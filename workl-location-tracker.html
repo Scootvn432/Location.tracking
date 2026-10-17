@@ -1,0 +1,758 @@
+<script type="module">
+import { initializeApp }                      from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
+import { getAuth, signInWithEmailAndPassword,
+         createUserWithEmailAndPassword,
+         updateProfile, updatePassword,
+         sendPasswordResetEmail, signOut,
+         onAuthStateChanged }                 from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
+import { getDatabase, ref, set, get, update,
+         remove, onValue, off }               from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js';
+
+// ════════════════════════════════════════════════════════════
+//  CONSTANTS & HELPERS
+// ════════════════════════════════════════════════════════════
+const LOCS    = ['home','lidcombe','alexandria','onroad'];
+const LABELS  = {home:'Home',lidcombe:'Lidcombe',alexandria:'Alexandria',onroad:'On Road'};
+const ICONS   = {home:'🏠',lidcombe:'🏢',alexandria:'🏛',onroad:'🚗'};
+const DAYS    = ['Mon','Tue','Wed','Thu','Fri'];
+const DOWNAMES= ['','Monday','Tuesday','Wednesday','Thursday','Friday'];
+const DEFAULT_COLOURS = {home:'#06b6d4',lid:'#a855f7',alex:'#10b981',road:'#f97316'};
+const THEME_PRESETS = {
+  default:{home:'#06b6d4',lid:'#a855f7',alex:'#10b981',road:'#f97316'},
+  ocean:  {home:'#38bdf8',lid:'#818cf8',alex:'#2dd4bf',road:'#fb7185'},
+  forest: {home:'#4ade80',lid:'#a3e635',alex:'#34d399',road:'#facc15'},
+  sunset: {home:'#f43f5e',lid:'#fb923c',alex:'#fbbf24',road:'#e879f9'},
+  mono:   {home:'#94a3b8',lid:'#64748b',alex:'#cbd5e1',road:'#f1f5f9'},
+};
+
+function isoDate(d)   { return d.toISOString().slice(0,10); }
+function isToday(d)   { return isoDate(d)===isoDate(new Date()); }
+function isWeekend(d) { return d.getDay()===0||d.getDay()===6; }
+function addDays(d,n) { const x=new Date(d); x.setDate(x.getDate()+n); return x; }
+function fmtH(h)      { return (h%1===0)?String(h):h.toFixed(1); }
+function fmtLong(d)   { return d.toLocaleDateString('en-AU',{weekday:'long',day:'numeric',month:'short',year:'numeric'}); }
+function fmtShort(d)  { return d.toLocaleDateString('en-AU',{day:'numeric',month:'short'}); }
+function fmtFull(d)   { return d.toLocaleDateString('en-AU',{day:'numeric',month:'long',year:'numeric'}); }
+function maxH()       { return globalSettings.workEnd-globalSettings.workStart; }
+function getMonday(d) { const dt=new Date(d); dt.setHours(0,0,0,0); const dy=dt.getDay(); dt.setDate(dt.getDate()+(dy===0?-6:1-dy)); return dt; }
+function rec(iso)     { return data[iso]||{home:0,lidcombe:0,alexandria:0,onroad:0}; }
+function dayTotal(iso){ return LOCS.reduce((s,k)=>s+(rec(iso)[k]||0),0); }
+function hasData(iso) { return dayTotal(iso)>0; }
+function hexToRgb(hex){ const r=parseInt(hex.slice(1,3),16),g=parseInt(hex.slice(3,5),16),b=parseInt(hex.slice(5,7),16); return `${r},${g},${b}`; }
+function getCurrentColours(){ return JSON.parse(localStorage.getItem('wlt_colours')||'null')||{...DEFAULT_COLOURS}; }
+
+// ════════════════════════════════════════════════════════════
+//  SAVE STATUS INDICATOR
+// ════════════════════════════════════════════════════════════
+let saveStatusTimer = null;
+function showSaveStatus(state, msg) {
+  const bar  = document.getElementById('save-bar');
+  const stat = document.getElementById('save-status');
+  const txt  = document.getElementById('save-status-text');
+  bar.className  = 'save-bar ' + state;
+  stat.className = 'save-status show ' + state;
+  txt.textContent = msg;
+  clearTimeout(saveStatusTimer);
+  if (state === 'saved') {
+    saveStatusTimer = setTimeout(() => {
+      stat.classList.remove('show');
+      bar.className = 'save-bar';
+    }, 2500);
+  }
+}
+
+// ════════════════════════════════════════════════════════════
+//  TOAST
+// ════════════════════════════════════════════════════════════
+let _tt = null;
+function toast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg; el.classList.remove('hidden');
+  clearTimeout(_tt); _tt = setTimeout(()=>el.classList.add('hidden'), 2400);
+}
+window.toast = toast;
+
+function showScreen(id) {
+  document.getElementById('loader').style.display = 'none';
+  ['screen-setup','screen-login','screen-app'].forEach(s => {
+    document.getElementById(s).classList.toggle('active', s===id);
+  });
+  document.getElementById('tab-bar').style.display = id==='screen-app' ? 'flex' : 'none';
+}
+
+// ════════════════════════════════════════════════════════════
+//  STATE
+// ════════════════════════════════════════════════════════════
+let app, auth, db;
+let fbConfig         = JSON.parse(localStorage.getItem('wlt_fbconfig')||'null');
+let currentUser      = null;
+let currentRole      = 'user';
+let globalSettings   = {workStart:8, workEnd:16};
+let userDataListener = null;
+let data             = {};
+let wkStart          = getMonday(new Date());
+let bulkSelDows      = new Set();
+let bulkLoc          = null;
+let bulkHours        = 8;
+let selectedExportType = 'weekly';
+
+// ════════════════════════════════════════════════════════════
+//  COLOUR MANAGEMENT
+// ════════════════════════════════════════════════════════════
+function loadColours() {
+  const cols = getCurrentColours();
+  applyCSSColours(cols);
+  ['home','lid','alex','road'].forEach(k => {
+    const el = document.getElementById('col-'+k);
+    if (el) { el.value=cols[k]; document.getElementById('prev-'+k).style.background=cols[k]; document.getElementById('hex-'+k).textContent=cols[k]; }
+  });
+}
+
+function applyCSSColours(cols) {
+  const r = document.documentElement;
+  r.style.setProperty('--home', cols.home||DEFAULT_COLOURS.home);
+  r.style.setProperty('--lid',  cols.lid ||DEFAULT_COLOURS.lid);
+  r.style.setProperty('--alex', cols.alex||DEFAULT_COLOURS.alex);
+  r.style.setProperty('--road', cols.road||DEFAULT_COLOURS.road);
+  const toAlpha = (hex,a) => `rgba(${hexToRgb(hex)},${a})`;
+  r.style.setProperty('--home-bg', toAlpha(cols.home||DEFAULT_COLOURS.home,.1));
+  r.style.setProperty('--lid-bg',  toAlpha(cols.lid ||DEFAULT_COLOURS.lid, .1));
+  r.style.setProperty('--alex-bg', toAlpha(cols.alex||DEFAULT_COLOURS.alex,.1));
+  r.style.setProperty('--road-bg', toAlpha(cols.road||DEFAULT_COLOURS.road,.1));
+}
+
+window.livePreviewColour = function(key,val) {
+  document.getElementById('prev-'+key).style.background = val;
+  document.getElementById('hex-'+key).textContent = val;
+};
+window.applyColours = function() {
+  const cols = { home:document.getElementById('col-home').value, lid:document.getElementById('col-lid').value, alex:document.getElementById('col-alex').value, road:document.getElementById('col-road').value };
+  applyCSSColours(cols);
+  localStorage.setItem('wlt_colours', JSON.stringify(cols));
+  toast('Colours applied ✓'); render();
+};
+window.resetColours = function() {
+  localStorage.removeItem('wlt_colours');
+  applyCSSColours(DEFAULT_COLOURS);
+  ['home','lid','alex','road'].forEach(k => {
+    const el=document.getElementById('col-'+k);
+    if(el){ el.value=DEFAULT_COLOURS[k]; document.getElementById('prev-'+k).style.background=DEFAULT_COLOURS[k]; document.getElementById('hex-'+k).textContent=DEFAULT_COLOURS[k]; }
+  });
+  toast('Colours reset'); render();
+};
+window.applyThemePreset = function(name) {
+  const p = THEME_PRESETS[name]||THEME_PRESETS.default;
+  ['home','lid','alex','road'].forEach(k => {
+    const el=document.getElementById('col-'+k);
+    if(el){ el.value=p[k]; document.getElementById('prev-'+k).style.background=p[k]; document.getElementById('hex-'+k).textContent=p[k]; }
+  });
+  applyCSSColours(p);
+  localStorage.setItem('wlt_colours', JSON.stringify(p));
+  toast(`Theme "${name}" applied ✓`); render();
+};
+
+// ════════════════════════════════════════════════════════════
+//  SETUP
+// ════════════════════════════════════════════════════════════
+window.runSetup = async function() {
+  const apiKey=document.getElementById('cfg-apikey').value.trim();
+  const authDomain=document.getElementById('cfg-authdomain').value.trim();
+  const dbUrl=document.getElementById('cfg-dburl').value.trim();
+  const projectId=document.getElementById('cfg-projectid').value.trim();
+  const email=document.getElementById('cfg-adminemail').value.trim();
+  const pw=document.getElementById('cfg-adminpw').value;
+  const errEl=document.getElementById('setup-err');
+  if(!apiKey||!authDomain||!dbUrl||!projectId||!email||!pw){ errEl.textContent='Please fill in all fields.'; errEl.classList.add('show'); return; }
+  if(pw.length<6){ errEl.textContent='Password must be at least 6 characters.'; errEl.classList.add('show'); return; }
+  errEl.classList.remove('show');
+  const cfg={apiKey,authDomain,databaseURL:dbUrl,projectId};
+  try{
+    const sa=initializeApp(cfg,'setup'); const sauth=getAuth(sa); const sdb=getDatabase(sa);
+    const cred=await createUserWithEmailAndPassword(sauth,email,pw);
+    await updateProfile(cred.user,{displayName:'Admin'});
+    await set(ref(sdb,`users/${cred.user.uid}`),{name:'Admin',email,role:'admin',createdAt:Date.now()});
+    await set(ref(sdb,'globalSettings'),{workStart:8,workEnd:16});
+    localStorage.setItem('wlt_fbconfig',JSON.stringify(cfg));
+    toast('Setup complete! Reloading…');
+    setTimeout(()=>location.reload(),1200);
+  } catch(e){ errEl.textContent='Error: '+e.message; errEl.classList.add('show'); }
+};
+
+// ════════════════════════════════════════════════════════════
+//  FIREBASE INIT
+// ════════════════════════════════════════════════════════════
+async function initFirebase() {
+  if(!fbConfig){ showScreen('screen-setup'); return; }
+  try{ app=initializeApp(fbConfig); } catch{ app=initializeApp(fbConfig,'main'); }
+  auth=getAuth(app); db=getDatabase(app);
+  onAuthStateChanged(auth, async user => {
+    if(user){
+      currentUser=user;
+      await loadUserRole(); await loadGlobalSettings();
+      setupUserDataListener(); setupUserUI(); loadAdminUsers();
+      showScreen('screen-app');
+    } else {
+      currentUser=null;
+      if(userDataListener){ off(userDataListener); userDataListener=null; }
+      showScreen('screen-login');
+    }
+  });
+}
+
+async function loadUserRole(){ const s=await get(ref(db,`users/${currentUser.uid}/role`)); currentRole=s.exists()?s.val():'user'; }
+async function loadGlobalSettings(){ const s=await get(ref(db,'globalSettings')); if(s.exists()) globalSettings=s.val(); document.getElementById('maxh-lbl').textContent=maxH(); }
+
+function setupUserDataListener() {
+  if(userDataListener) off(userDataListener);
+  userDataListener = onValue(ref(db,`data/${currentUser.uid}`), snap => {
+    data = snap.exists() ? snap.val() : {};
+    render();
+    buildBulkHourChips();
+  });
+}
+
+function setupUserUI() {
+  const name = currentUser.displayName || currentUser.email.split('@')[0];
+  const ini  = name.split(' ').map(n=>n[0]).join('').toUpperCase().slice(0,2);
+  document.getElementById('user-avatar').textContent       = ini;
+  document.getElementById('user-display-name').textContent = name;
+  document.getElementById('user-role-text').textContent    = currentRole;
+  document.getElementById('s-name').value                  = currentUser.displayName||'';
+  document.getElementById('admin-tab').style.display       = currentRole==='admin'?'flex':'none';
+  if(currentRole==='admin'){ document.getElementById('g-start').value=globalSettings.workStart; document.getElementById('g-end').value=globalSettings.workEnd; updateGHint(); }
+  const now=new Date(),y=now.getFullYear(),m=now.getMonth();
+  document.getElementById('r-from').value  = new Date(y,m,1).toISOString().slice(0,10);
+  document.getElementById('r-to').value    = new Date(y,m+1,0).toISOString().slice(0,10);
+  document.getElementById('bulk-from').value = new Date(y,m,1).toISOString().slice(0,10);
+  document.getElementById('bulk-to').value   = new Date(y,m+1,0).toISOString().slice(0,10);
+  // PDF defaults
+  const pdfMonthEl = document.getElementById('pdf-month');
+  if(pdfMonthEl) pdfMonthEl.value = `${y}-${String(m+1).padStart(2,'0')}`;
+  const pdfFromEl = document.getElementById('pdf-from');
+  const pdfToEl   = document.getElementById('pdf-to');
+  if(pdfFromEl) pdfFromEl.value = new Date(y,m,1).toISOString().slice(0,10);
+  if(pdfToEl)   pdfToEl.value   = new Date(y,m+1,0).toISOString().slice(0,10);
+  const titleEl = document.getElementById('pdf-title');
+  if(titleEl) titleEl.value = name + "'s Location Log";
+  loadColours();
+  buildBulkHourChips();
+}
+
+// ════════════════════════════════════════════════════════════
+//  AUTH
+// ════════════════════════════════════════════════════════════
+window.doLogin = async function() {
+  const email=document.getElementById('login-email').value.trim();
+  const pw=document.getElementById('login-pw').value;
+  const errEl=document.getElementById('login-err');
+  const btn=document.getElementById('btn-login');
+  errEl.classList.remove('show'); btn.disabled=true; btn.textContent='Signing in…';
+  try{ await signInWithEmailAndPassword(auth,email,pw); }
+  catch(e){
+    const msgs={'auth/user-not-found':'No account with that email.','auth/wrong-password':'Incorrect password.','auth/invalid-email':'Enter a valid email.','auth/too-many-requests':'Too many attempts.','auth/invalid-credential':'Invalid email or password.'};
+    errEl.textContent=msgs[e.code]||'Sign in failed: '+e.message;
+    errEl.classList.add('show'); btn.disabled=false; btn.textContent='Sign In →';
+  }
+};
+window.doLogout = async function(){ closeUserMenu(); await signOut(auth); };
+window.doReset  = async function(){
+  const email=document.getElementById('login-email').value.trim();
+  if(!email){ const e=document.getElementById('login-err'); e.textContent='Enter your email first.'; e.classList.add('show'); return; }
+  try{ await sendPasswordResetEmail(auth,email); toast('Reset email sent ✓'); } catch{ toast('Could not send reset email'); }
+};
+
+// ════════════════════════════════════════════════════════════
+//  DATA PERSISTENCE — with Save Status
+// ════════════════════════════════════════════════════════════
+async function persistDay(iso, record) {
+  showSaveStatus('saving', 'Saving…');
+  try {
+    await set(ref(db, `data/${currentUser.uid}/${iso}`), record);
+    showSaveStatus('saved', 'Saved ✓');
+  } catch(e) {
+    showSaveStatus('error', 'Save failed');
+    throw e;
+  }
+}
+
+async function deleteDay(iso) {
+  showSaveStatus('saving', 'Saving…');
+  try {
+    await remove(ref(db, `data/${currentUser.uid}/${iso}`));
+    showSaveStatus('saved', 'Cleared ✓');
+  } catch(e) {
+    showSaveStatus('error', 'Save failed');
+    throw e;
+  }
+}
+
+async function persistBulk(updates) {
+  showSaveStatus('saving', 'Saving…');
+  try {
+    await update(ref(db), updates);
+    showSaveStatus('saved', 'All days saved ✓');
+  } catch(e) {
+    showSaveStatus('error', 'Save failed');
+    throw e;
+  }
+}
+
+// ════════════════════════════════════════════════════════════
+//  RENDER
+// ════════════════════════════════════════════════════════════
+function render() {
+  const fri = addDays(wkStart,4);
+  document.getElementById('week-label').textContent = fmtShort(wkStart)+' – '+fmtShort(fri)+' '+wkStart.getFullYear();
+  const days = Array.from({length:5},(_,i)=>addDays(wkStart,i));
+  const isos = days.map(isoDate);
+  renderDesktop(days,isos); renderMobile(days,isos); renderTotals(isos);
+}
+
+function renderDesktop(days,isos) {
+  const hdr=document.getElementById('day-headers'); hdr.innerHTML='<div></div>';
+  days.forEach((d,i)=>{ const tot=dayTotal(isos[i]); const el=document.createElement('div'); el.className='dh'+(isToday(d)?' today-col':''); el.innerHTML=`<div class="dh-dow">${DAYS[i]}</div><span class="dh-num">${d.getDate()}</span><span class="dh-sub">${tot>0?fmtH(tot)+'h':fmtShort(d)}</span>`; hdr.appendChild(el); });
+  const rc=document.getElementById('loc-rows'); rc.innerHTML='';
+  LOCS.forEach(loc=>{
+    const row=document.createElement('div'); row.className='loc-row';
+    const wkH=isos.reduce((s,iso)=>s+(rec(iso)[loc]||0),0);
+    const cssK=loc==='lidcombe'?'lid':loc==='alexandria'?'alex':loc;
+    const lbl=document.createElement('div'); lbl.className='loc-label';
+    lbl.innerHTML=`<span class="loc-label-name" style="color:var(--${cssK})">${LABELS[loc]}</span><span class="loc-label-hrs">${fmtH(wkH)}h</span>`;
+    row.appendChild(lbl);
+    days.forEach((d,i)=>{ const iso=isos[i]; const h=rec(iso)[loc]||0; const cell=document.createElement('div'); if(h>0){ cell.className=`cell ${loc}`; cell.innerHTML=`<span class="cell-h">${fmtH(h)}h</span>`; } else { cell.className='cell empty'; cell.innerHTML=`<span class="cell-plus">+</span>`; } cell.addEventListener('click',()=>openPopup(iso,fmtLong(d))); row.appendChild(cell); });
+    rc.appendChild(row);
+  });
+}
+
+function renderMobile(days,isos) {
+  const mc=document.getElementById('mobile-cards'); mc.innerHTML='';
+  days.forEach((d,i)=>{ const iso=isos[i]; const r=rec(iso); const tot=dayTotal(iso); const active=LOCS.filter(k=>(r[k]||0)>0); const card=document.createElement('div'); card.className='mcard'+(isToday(d)?' today-mc':''); let ph=active.length>0?active.map(k=>`<span class="mc-pill ${k}">${ICONS[k]} ${LABELS[k]} · ${fmtH(r[k])}h</span>`).join(''):`<span class="mc-empty">No location logged</span>`; card.innerHTML=`<div class="mc-top"><span class="mc-day${isToday(d)?' gold':''}">${DAYS[i]} ${d.getDate()}</span><span class="mc-meta">${fmtShort(d)}${tot>0?' · '+fmtH(tot)+'h':''}</span></div><div class="mc-pills">${ph}</div><div class="mc-hint">${tot>0?'Tap to edit →':'Tap to log →'}</div>`; card.addEventListener('click',()=>openPopup(iso,fmtLong(d))); mc.appendChild(card); });
+}
+
+function renderTotals(isos) {
+  const t={home:0,lidcombe:0,alexandria:0,onroad:0}; let dl=0;
+  isos.forEach(iso=>{ if(hasData(iso)) dl++; LOCS.forEach(k=>{ t[k]+=(rec(iso)[k]||0); }); });
+  const total=LOCS.reduce((s,k)=>s+t[k],0), maxV=Math.max(...Object.values(t),1);
+  const idm={home:'home',lidcombe:'lid',alexandria:'alex',onroad:'road'};
+  LOCS.forEach(k=>{ const id=idm[k]; document.getElementById(`tw-${id}`).textContent=fmtH(t[k]); document.getElementById(`tf-${id}`).style.width=(t[k]/maxV*100)+'%'; document.getElementById(`tp-${id}`).textContent=total>0?Math.round(t[k]/total*100)+'%':'0%'; });
+  document.getElementById('ss-total').textContent=fmtH(total);
+  document.getElementById('ss-days').textContent=`${dl}/5`;
+  document.getElementById('ss-rem').textContent=fmtH(Math.max(0,maxH()*5-total));
+  document.getElementById('ss-wfh').textContent=total>0?Math.round((t.home||0)/total*100)+'%':'0%';
+  const topK=LOCS.reduce((a,b)=>(t[a]||0)>=(t[b]||0)?a:b);
+  document.getElementById('ss-top').textContent=(t[topK]||0)>0?LABELS[topK]:'—';
+}
+
+document.getElementById('prev-wk').onclick   = ()=>{ wkStart=addDays(wkStart,-7); render(); };
+document.getElementById('next-wk').onclick   = ()=>{ wkStart=addDays(wkStart,7);  render(); };
+document.getElementById('today-btn').onclick = ()=>{ wkStart=getMonday(new Date()); render(); };
+
+// ════════════════════════════════════════════════════════════
+//  POPUP
+// ════════════════════════════════════════════════════════════
+let editISO=null, selLoc=null, selHrs=0, splitMode=false;
+let sp={home:0,lidcombe:0,alexandria:0,onroad:0};
+
+window.openPopup = function(iso,longDate) {
+  editISO=iso; const r=rec(iso); const active=LOCS.filter(k=>(r[k]||0)>0); splitMode=active.length>1;
+  document.getElementById('pop-ttl').textContent='Log '+longDate.split(',')[0];
+  document.getElementById('pop-sub').textContent=longDate+' · '+globalSettings.workStart+':00–'+globalSettings.workEnd+':00 ('+maxH()+'h)';
+  document.getElementById('maxh-lbl').textContent=maxH();
+  selLoc=null; selHrs=0;
+  document.querySelectorAll('.ploc-btn').forEach(b=>b.classList.remove('sel'));
+  document.getElementById('phours').classList.remove('show');
+  sp={home:r.home||0,lidcombe:r.lidcombe||0,alexandria:r.alexandria||0,onroad:r.onroad||0};
+  if(!splitMode&&active.length===1){ selLoc=active[0]; selHrs=r[active[0]]||0; document.querySelectorAll('.ploc-btn').forEach(b=>{ if(b.dataset.loc===selLoc) b.classList.add('sel'); }); buildChips(selHrs); document.getElementById('phours').classList.add('show'); }
+  document.getElementById('split-chk').checked=splitMode; toggleSplit();
+  document.getElementById('overlay').classList.add('open'); updateSaveBtn();
+};
+window.closePopup = function(){ document.getElementById('overlay').classList.remove('open'); editISO=null; };
+window.pickLoc = function(btn){ if(splitMode) return; document.querySelectorAll('.ploc-btn').forEach(b=>b.classList.remove('sel')); btn.classList.add('sel'); selLoc=btn.dataset.loc; selHrs=selHrs||maxH(); buildChips(selHrs); document.getElementById('phours').classList.add('show'); updateSaveBtn(); };
+function buildChips(current){ const con=document.getElementById('chips'); con.innerHTML=''; const steps=[]; for(let h=0.5;h<=maxH();h=Math.round((h+0.5)*10)/10) steps.push(h); steps.forEach(h=>{ const c=document.createElement('button'); c.className='chip'+(current===h?' sel':''); c.textContent=h+'h'; c.onclick=()=>{ selHrs=h; con.querySelectorAll('.chip').forEach(x=>x.classList.remove('sel')); c.classList.add('sel'); updateSaveBtn(); }; con.appendChild(c); }); }
+window.toggleSplit = function(){ splitMode=document.getElementById('split-chk').checked; document.getElementById('single-sec').style.display=splitMode?'none':'block'; splitMode?document.getElementById('split-body').classList.add('show'):document.getElementById('split-body').classList.remove('show'); updateSplitUI(); updateSaveBtn(); };
+window.adj = function(loc,delta){ const tot=Object.values(sp).reduce((a,b)=>a+b,0); if(delta>0&&tot>=maxH()) return; sp[loc]=Math.max(0,Math.min(maxH(),Math.round(((sp[loc]||0)+delta)*10)/10)); updateSplitUI(); updateSaveBtn(); };
+function updateSplitUI(){ const idm={home:'home',lidcombe:'lid',alexandria:'alex',onroad:'road'}; LOCS.forEach(k=>{ document.getElementById(`sh-${idm[k]}`).textContent=fmtH(sp[k]||0); }); const tot=Object.values(sp).reduce((a,b)=>a+b,0); const el=document.getElementById('split-tot'); el.textContent=`Total: ${fmtH(tot)} / ${maxH()}h`; el.className='split-tot '+(tot>maxH()?'bad':'ok'); }
+function updateSaveBtn(){ const btn=document.getElementById('pbtn-save'); if(splitMode){ const tot=Object.values(sp).reduce((a,b)=>a+b,0); btn.disabled=tot<=0||tot>maxH(); } else btn.disabled=!selLoc||selHrs<=0; }
+
+window.saveDay = async function() {
+  if(!editISO) return;
+  let record;
+  if(splitMode){ const tot=Object.values(sp).reduce((a,b)=>a+b,0); if(tot<=0||tot>maxH()) return; record={...sp}; }
+  else { if(!selLoc||selHrs<=0) return; record={home:0,lidcombe:0,alexandria:0,onroad:0}; record[selLoc]=selHrs; }
+  await persistDay(editISO, record);
+  closePopup(); toast('Saved ✓');
+};
+window.clearDay = async function(){ if(!editISO) return; await deleteDay(editISO); closePopup(); toast('Entry cleared'); };
+document.getElementById('overlay').addEventListener('click',e=>{ if(e.target===document.getElementById('overlay')) closePopup(); });
+document.addEventListener('keydown',e=>{ if(e.key==='Escape') closePopup(); });
+
+// ════════════════════════════════════════════════════════════
+//  BULK DAY ASSIGNMENT
+// ════════════════════════════════════════════════════════════
+function buildBulkHourChips(){
+  const con=document.getElementById('bulk-hour-chips'); if(!con) return; con.innerHTML='';
+  const steps=[]; for(let h=0.5;h<=maxH();h=Math.round((h+0.5)*10)/10) steps.push(h);
+  bulkHours=maxH();
+  steps.forEach(h=>{ const c=document.createElement('button'); c.className='bhchip'+(bulkHours===h?' sel':''); c.textContent=h+'h'; c.onclick=()=>{ bulkHours=h; con.querySelectorAll('.bhchip').forEach(x=>x.classList.remove('sel')); c.classList.add('sel'); updateBulkPreview(); }; con.appendChild(c); });
+}
+window.toggleDowChip = function(el){ const dow=+el.dataset.dow; if(bulkSelDows.has(dow)){ bulkSelDows.delete(dow); el.classList.remove('sel'); } else { bulkSelDows.add(dow); el.classList.add('sel'); } updateBulkPreview(); };
+window.pickBulkLoc = function(btn){ document.querySelectorAll('.bloc-btn').forEach(b=>b.classList.remove('sel')); btn.classList.add('sel'); bulkLoc=btn.dataset.loc; updateBulkPreview(); };
+window.updateBulkPreview = function(){
+  const fromStr=document.getElementById('bulk-from').value, toStr=document.getElementById('bulk-to').value;
+  const prev=document.getElementById('bulk-preview'), assignBtn=document.getElementById('btn-bulk-assign');
+  document.getElementById('bulk-result').className='bulk-result';
+  if(!fromStr||!toStr||bulkSelDows.size===0||!bulkLoc){ prev.classList.remove('show'); assignBtn.disabled=true; return; }
+  const from=new Date(fromStr+'T00:00:00'), to=new Date(toStr+'T00:00:00');
+  if(from>to){ prev.classList.remove('show'); assignBtn.disabled=true; return; }
+  let count=0; let cur=new Date(from);
+  while(cur<=to){ if(bulkSelDows.has(cur.getDay())) count++; cur=addDays(cur,1); }
+  const dowLabels=[...bulkSelDows].sort().map(d=>DOWNAMES[d]).join(', ');
+  prev.innerHTML=`Will assign <span class="preview-count">${count} day${count!==1?'s':''}</span> — all <strong>${dowLabels}</strong> between <strong>${fmtShort(from)}</strong> and <strong>${fmtShort(to)}</strong> → <strong>${ICONS[bulkLoc]} ${LABELS[bulkLoc]}</strong> for <strong>${fmtH(bulkHours)}h</strong>`;
+  prev.classList.add('show'); assignBtn.disabled=count===0;
+};
+window.doBulkAssign = async function(){
+  const fromStr=document.getElementById('bulk-from').value, toStr=document.getElementById('bulk-to').value;
+  const resEl=document.getElementById('bulk-result');
+  if(!fromStr||!toStr||bulkSelDows.size===0||!bulkLoc||!bulkHours) return;
+  const from=new Date(fromStr+'T00:00:00'), to=new Date(toStr+'T00:00:00');
+  const btn=document.getElementById('btn-bulk-assign');
+  btn.disabled=true; btn.textContent='Assigning…';
+  try{
+    let count=0; let cur=new Date(from); const updates={};
+    while(cur<=to){ if(bulkSelDows.has(cur.getDay())){ const iso=isoDate(cur); const record={home:0,lidcombe:0,alexandria:0,onroad:0}; record[bulkLoc]=bulkHours; updates[`data/${currentUser.uid}/${iso}`]=record; count++; } cur=addDays(cur,1); }
+    await persistBulk(updates);
+    resEl.textContent=`✓ Assigned ${count} day${count!==1?'s':''} to ${LABELS[bulkLoc]} (${fmtH(bulkHours)}h each)`;
+    resEl.className='bulk-result ok'; toast(`${count} days assigned ✓`);
+    wkStart=getMonday(from); render();
+  } catch(e){ resEl.textContent='Error: '+e.message; resEl.className='bulk-result err'; }
+  btn.disabled=false; btn.textContent='Assign Days →';
+};
+
+// ════════════════════════════════════════════════════════════
+//  REPORT
+// ════════════════════════════════════════════════════════════
+window.runReport = function(){
+  const fromStr=document.getElementById('r-from').value, toStr=document.getElementById('r-to').value;
+  if(!fromStr||!toStr){ toast('Select a date range'); return; }
+  const from=new Date(fromStr+'T00:00:00'), to=new Date(toStr+'T00:00:00');
+  if(from>to){ toast('From must be before To'); return; }
+  const t={home:0,lidcombe:0,alexandria:0,onroad:0}; let dl=0,wdays=0,cur=new Date(from);
+  while(cur<=to){ if(!isWeekend(cur)){ wdays++; const iso=isoDate(cur); if(hasData(iso)){ dl++; LOCS.forEach(k=>{ t[k]+=(data[iso]?data[iso][k]||0:0); }); } } cur=addDays(cur,1); }
+  const total=LOCS.reduce((s,k)=>s+(t[k]||0),0), maxV=Math.max(...Object.values(t),1);
+  const idm={home:'home',lidcombe:'lid',alexandria:'alex',onroad:'road'};
+  LOCS.forEach(k=>{ const id=idm[k]; document.getElementById(`rr-${id}`).textContent=fmtH(t[k]); document.getElementById(`rp-${id}`).textContent=total>0?Math.round(t[k]/total*100)+'%':'0%'; });
+  const chart=document.getElementById('bar-chart'); chart.innerHTML='';
+  LOCS.forEach(k=>{ const pct=Math.round(t[k]/maxV*100); chart.innerHTML+=`<div class="bc-row"><span class="bc-lbl ${k}">${LABELS[k]}</span><div class="bc-track"><div class="bc-fill ${k}" style="width:${pct}%"></div></div><span class="bc-val">${fmtH(t[k])}h</span></div>`; });
+  document.getElementById('rs-total').textContent=fmtH(total); document.getElementById('rs-dlogged').textContent=dl; document.getElementById('rs-wdays').textContent=wdays;
+  document.getElementById('rs-wfh').textContent=total>0?Math.round((t.home||0)/total*100)+'%':'0%';
+  const offH=(t.lidcombe||0)+(t.alexandria||0); document.getElementById('rs-office').textContent=total>0?Math.round(offH/total*100)+'%':'0%';
+  const topK=LOCS.reduce((a,b)=>(t[a]||0)>=(t[b]||0)?a:b); document.getElementById('rs-top').textContent=(t[topK]||0)>0?LABELS[topK]:'—';
+  document.getElementById('rpt-headline').textContent=`${from.toLocaleDateString('en-AU',{day:'numeric',month:'short',year:'numeric'})} → ${to.toLocaleDateString('en-AU',{day:'numeric',month:'short',year:'numeric'})} · ${wdays} working days · ${dl} logged`;
+  const rr=document.getElementById('rpt-results'); rr.classList.add('show'); rr.style.display='block';
+};
+window.setPreset = function(preset,btn){
+  document.querySelectorAll('.prs').forEach(b=>b.classList.remove('ap')); btn.classList.add('ap');
+  const now=new Date(),y=now.getFullYear(),m=now.getMonth();
+  let from,to;
+  if(preset==='thisweek'){from=getMonday(now);to=addDays(from,4);}
+  if(preset==='lastweek'){from=getMonday(addDays(now,-7));to=addDays(from,4);}
+  if(preset==='thismonth'){from=new Date(y,m,1);to=new Date(y,m+1,0);}
+  if(preset==='lastmonth'){from=new Date(y,m-1,1);to=new Date(y,m,0);}
+  if(preset==='thisyear'){from=new Date(y,0,1);to=new Date(y,11,31);}
+  document.getElementById('r-from').value=isoDate(from);
+  document.getElementById('r-to').value=isoDate(to);
+  runReport();
+};
+
+// ════════════════════════════════════════════════════════════
+//  PDF EXPORT — using jsPDF (CDN, no server needed)
+// ════════════════════════════════════════════════════════════
+window.selectExportType = function(el) {
+  document.querySelectorAll('.pdf-opt').forEach(o=>o.classList.remove('sel'));
+  el.classList.add('sel');
+  selectedExportType = el.dataset.export;
+  // Show/hide date fields
+  const rangeFrom = document.getElementById('pdf-date-range-field');
+  const rangeTo   = document.getElementById('pdf-date-to-field');
+  const monthFld  = document.getElementById('pdf-month-field');
+  rangeFrom.style.display = selectedExportType==='range' ? 'flex' : 'none';
+  rangeTo.style.display   = selectedExportType==='range' ? 'flex' : 'none';
+  monthFld.style.display  = selectedExportType==='monthly' ? 'flex' : 'none';
+};
+
+async function loadJsPDF() {
+  if (window.jspdf) return window.jspdf.jsPDF;
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = 'https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js';
+    s.onload  = () => resolve(window.jspdf.jsPDF);
+    s.onerror = reject;
+    document.head.appendChild(s);
+  });
+}
+
+function buildDateRange() {
+  const now = new Date(), y=now.getFullYear(), m=now.getMonth();
+  if (selectedExportType==='weekly') {
+    return { from: new Date(wkStart), to: addDays(wkStart,4), label:'Week of '+fmtShort(wkStart)+' – '+fmtShort(addDays(wkStart,4)) };
+  }
+  if (selectedExportType==='range') {
+    const f = new Date(document.getElementById('pdf-from').value+'T00:00:00');
+    const t = new Date(document.getElementById('pdf-to').value+'T00:00:00');
+    return { from:f, to:t, label:fmtFull(f)+' – '+fmtFull(t) };
+  }
+  if (selectedExportType==='monthly') {
+    const mv = document.getElementById('pdf-month').value;
+    const [my,mm] = mv.split('-').map(Number);
+    const f = new Date(my,mm-1,1), t = new Date(my,mm,0);
+    return { from:f, to:t, label:f.toLocaleDateString('en-AU',{month:'long',year:'numeric'}) };
+  }
+  if (selectedExportType==='alldata') {
+    const keys = Object.keys(data).sort();
+    if (!keys.length) return { from:new Date(), to:new Date(), label:'All Data' };
+    return { from:new Date(keys[0]+'T00:00:00'), to:new Date(keys[keys.length-1]+'T00:00:00'), label:'All Logged Data' };
+  }
+}
+
+function gatherRangeData(from, to) {
+  const totals={home:0,lidcombe:0,alexandria:0,onroad:0};
+  const days = [];
+  let daysLogged=0, workingDays=0;
+  let cur=new Date(from);
+  while(cur<=to){
+    if(!isWeekend(cur)){
+      workingDays++;
+      const iso=isoDate(cur);
+      const r=rec(iso);
+      const tot=dayTotal(iso);
+      days.push({ date:new Date(cur), iso, rec:r, total:tot, logged:tot>0 });
+      if(tot>0){ daysLogged++; LOCS.forEach(k=>{ totals[k]+=(r[k]||0); }); }
+    }
+    cur=addDays(cur,1);
+  }
+  const grandTotal=LOCS.reduce((s,k)=>s+(totals[k]||0),0);
+  return { totals, days, daysLogged, workingDays, grandTotal };
+}
+
+window.exportPDF = async function() {
+  const loadEl  = document.getElementById('pdf-loading');
+  const btn     = document.getElementById('btn-export-pdf');
+  loadEl.classList.add('show'); btn.disabled=true;
+
+  try {
+    const jsPDF  = await loadJsPDF();
+    const range  = buildDateRange();
+    const { totals, days, daysLogged, workingDays, grandTotal } = gatherRangeData(range.from, range.to);
+    const cols   = getCurrentColours();
+    const uname  = currentUser.displayName || currentUser.email.split('@')[0];
+    const title  = document.getElementById('pdf-title').value || uname+"'s Location Log";
+
+    // Hex to RGB arrays
+    const hexArr = hex => [parseInt(hex.slice(1,3),16),parseInt(hex.slice(3,5),16),parseInt(hex.slice(5,7),16)];
+    const C = { home:hexArr(cols.home), lid:hexArr(cols.lid), alex:hexArr(cols.alex), road:hexArr(cols.road) };
+    const locColour = k => k==='home'?C.home:k==='lidcombe'?C.lid:k==='alexandria'?C.alex:C.road;
+
+    const doc = new jsPDF({ orientation:'portrait', unit:'mm', format:'a4' });
+    const PW=210, PH=297, ML=14, MR=14, TW=PW-ML-MR;
+    let y=16;
+
+    // ─── HEADER BAR ───────────────────────────────
+    doc.setFillColor(6,8,16); doc.rect(0,0,PW,22,'F');
+    // coloured stripe
+    const stripeW=TW/4;
+    [[cols.home,0],[cols.lid,1],[cols.alex,2],[cols.road,3]].forEach(([c,i])=>{
+      const [r,g,b]=hexArr(c); doc.setFillColor(r,g,b); doc.rect(ML+i*stripeW,18,stripeW,4,'F');
+    });
+
+    // Logo pin icon (text) + title
+    doc.setTextColor(245,158,11); doc.setFontSize(8); doc.setFont('helvetica','bold');
+    doc.text('WORK LOCATION TRACKER',ML,9);
+    doc.setTextColor(226,232,248); doc.setFontSize(14);
+    doc.text(title, ML, 15.5);
+    doc.setTextColor(90,106,138); doc.setFontSize(7.5);
+    doc.text(`Generated ${new Date().toLocaleDateString('en-AU',{day:'numeric',month:'long',year:'numeric'})} · ${uname}`, PW-MR-2, 9, {align:'right'});
+
+    y = 32;
+
+    // ─── PERIOD BADGE ─────────────────────────────
+    doc.setFillColor(22,31,48); doc.roundedRect(ML,y-4,TW,10,2,2,'F');
+    doc.setTextColor(245,158,11); doc.setFontSize(7.5); doc.setFont('helvetica','bold');
+    doc.text('PERIOD', ML+4, y+1.5);
+    doc.setTextColor(226,232,248); doc.setFontSize(8.5); doc.setFont('helvetica','normal');
+    doc.text(range.label, ML+26, y+1.5);
+    doc.setTextColor(90,106,138); doc.setFontSize(7.5);
+    doc.text(`${workingDays} working days · ${daysLogged} logged`, PW-MR-3, y+1.5, {align:'right'});
+    y += 14;
+
+    // ─── SUMMARY TOTALS ────────────────────────────
+    doc.setTextColor(90,106,138); doc.setFontSize(7); doc.setFont('helvetica','bold');
+    doc.text('SUMMARY BY LOCATION', ML, y); y+=5;
+
+    const cardW=(TW-9)/4, cardH=24;
+    LOCS.forEach((loc,i)=>{
+      const cx=ML+i*(cardW+3), cy=y;
+      const [r,g,b]=locColour(loc);
+      doc.setFillColor(22,31,48); doc.roundedRect(cx,cy,cardW,cardH,2,2,'F');
+      doc.setFillColor(r,g,b); doc.rect(cx,cy,cardW,1.5,'F');
+      doc.setTextColor(r,g,b); doc.setFontSize(6.5); doc.setFont('helvetica','bold');
+      doc.text(LABELS[loc].toUpperCase(),cx+3,cy+6);
+      doc.setTextColor(226,232,248); doc.setFontSize(16); doc.setFont('helvetica','bold');
+      doc.text(fmtH(totals[loc])+'h', cx+3, cy+15);
+      doc.setTextColor(90,106,138); doc.setFontSize(6.5); doc.setFont('helvetica','normal');
+      const pct = grandTotal>0 ? Math.round(totals[loc]/grandTotal*100)+'%' : '0%';
+      doc.text(pct+' of total', cx+3, cy+20.5);
+    });
+    y += cardH + 5;
+
+    // Total strip
+    doc.setFillColor(17,24,39); doc.roundedRect(ML,y,TW,8,2,2,'F');
+    doc.setTextColor(226,232,248); doc.setFontSize(8); doc.setFont('helvetica','bold');
+    doc.text(`TOTAL: ${fmtH(grandTotal)}h`, ML+4, y+5.5);
+    const wfhPct = grandTotal>0 ? Math.round((totals.home||0)/grandTotal*100)+'%' : '0%';
+    doc.setTextColor(90,106,138); doc.setFontSize(7.5);
+    doc.text(`WFH: ${wfhPct}  ·  Working Days: ${workingDays}  ·  Days Logged: ${daysLogged}`, PW-MR-3, y+5.5, {align:'right'});
+    y += 14;
+
+    // ─── DAY-BY-DAY TABLE ──────────────────────────
+    doc.setTextColor(90,106,138); doc.setFontSize(7); doc.setFont('helvetica','bold');
+    doc.text('DAY BY DAY', ML, y); y+=4;
+
+    // Table header
+    const colWidths=[38,28,28,28,28,TW-150];
+    const cols2=['Date','Home','Lidcombe','Alexandria','On Road','Total'];
+    doc.setFillColor(22,31,48);
+    doc.rect(ML, y, TW, 6,'F');
+    let tx=ML+2;
+    cols2.forEach((c,i)=>{ doc.setTextColor(90,106,138); doc.setFontSize(6.5); doc.setFont('helvetica','bold'); doc.text(c.toUpperCase(),tx,y+4); tx+=colWidths[i]; });
+    y+=6;
+
+    // Table rows
+    let rowAlt=false;
+    for(const day of days){
+      if(y>PH-20){ doc.addPage(); y=16; }
+      if(rowAlt) doc.setFillColor(17,24,39);
+      else doc.setFillColor(13,16,24);
+      doc.rect(ML,y,TW,6.5,'F');
+      rowAlt=!rowAlt;
+
+      tx=ML+2;
+      // Date
+      doc.setTextColor(day.logged?226:90,day.logged?232:106,day.logged?248:138);
+      doc.setFontSize(7); doc.setFont('helvetica',day.logged?'bold':'normal');
+      doc.text(day.date.toLocaleDateString('en-AU',{weekday:'short',day:'numeric',month:'short'}),tx,y+4.5);
+      tx+=colWidths[0];
+      // Location hours
+      LOCS.forEach((loc,li)=>{
+        const h=day.rec[loc]||0;
+        if(h>0){ const [r,g,b]=locColour(loc); doc.setTextColor(r,g,b); doc.setFont('helvetica','bold'); }
+        else    { doc.setTextColor(50,60,80); doc.setFont('helvetica','normal'); }
+        doc.setFontSize(7);
+        doc.text(h>0?fmtH(h)+'h':'—', tx, y+4.5);
+        tx+=colWidths[li+1];
+      });
+      // Total
+      doc.setTextColor(day.total>0?226:50, day.total>0?232:60, day.total>0?248:80);
+      doc.setFontSize(7); doc.setFont('helvetica',day.total>0?'bold':'normal');
+      doc.text(day.total>0?fmtH(day.total)+'h':'—', tx, y+4.5);
+      y+=6.5;
+    }
+    y+=4;
+
+    // ─── BAR CHART ──────────────────────────────────
+    if(y>PH-50){ doc.addPage(); y=16; }
+    doc.setTextColor(90,106,138); doc.setFontSize(7); doc.setFont('helvetica','bold');
+    doc.text('HOURS DISTRIBUTION', ML, y); y+=5;
+    const maxBar=Math.max(...Object.values(totals),1);
+    const barMaxW=TW-50;
+    LOCS.forEach(loc=>{
+      const h=totals[loc]; const pct=h/maxBar;
+      const [r,g,b]=locColour(loc);
+      doc.setTextColor(r,g,b); doc.setFontSize(7); doc.setFont('helvetica','bold');
+      doc.text(LABELS[loc], ML, y+3.5);
+      doc.setFillColor(22,31,48); doc.roundedRect(ML+32, y, barMaxW, 5, 1,1,'F');
+      if(h>0){ doc.setFillColor(r,g,b); doc.roundedRect(ML+32, y, Math.max(2,barMaxW*pct), 5, 1,1,'F'); }
+      doc.setTextColor(90,106,138); doc.setFontSize(7); doc.setFont('helvetica','normal');
+      doc.text(fmtH(h)+'h', ML+32+barMaxW+3, y+3.5);
+      y+=8;
+    });
+
+    // ─── FOOTER ───────────────────────────────────
+    const totalPages=doc.internal.getNumberOfPages();
+    for(let p=1;p<=totalPages;p++){
+      doc.setPage(p);
+      doc.setFillColor(6,8,16); doc.rect(0,PH-8,PW,8,'F');
+      doc.setTextColor(50,60,80); doc.setFontSize(6.5); doc.setFont('helvetica','normal');
+      doc.text('Work Location Tracker · Confidential', ML, PH-3);
+      doc.text(`Page ${p} of ${totalPages}`, PW-MR, PH-3, {align:'right'});
+    }
+
+    // Save
+    const fname=`${(title||'location-log').replace(/[^a-z0-9]/gi,'-').toLowerCase()}-${isoDate(new Date())}.pdf`;
+    doc.save(fname);
+    toast('PDF exported ✓');
+    showSaveStatus('saved', 'PDF saved ✓');
+  } catch(e) {
+    toast('PDF error: '+e.message);
+    console.error(e);
+  }
+  loadEl.classList.remove('show'); btn.disabled=false;
+};
+
+// ════════════════════════════════════════════════════════════
+//  CSV EXPORT
+// ════════════════════════════════════════════════════════════
+window.exportCSV = function() {
+  const range = buildDateRange();
+  const { days } = gatherRangeData(range.from, range.to);
+  const uname = currentUser.displayName || currentUser.email.split('@')[0];
+  let csv  = `Work Location Tracker — ${uname}\n`;
+  csv += `Period: ${range.label}\n`;
+  csv += `Generated: ${new Date().toLocaleDateString('en-AU')}\n\n`;
+  csv += 'Date,Day,Home (h),Lidcombe (h),Alexandria (h),On Road (h),Total (h)\n';
+  days.forEach(d=>{
+    const dow=d.date.toLocaleDateString('en-AU',{weekday:'long'});
+    csv+=`"${d.date.toLocaleDateString('en-AU')}","${dow}",${fmtH(d.rec.home||0)},${fmtH(d.rec.lidcombe||0)},${fmtH(d.rec.alexandria||0)},${fmtH(d.rec.onroad||0)},${fmtH(d.total)}\n`;
+  });
+  csv+='\nTotals\n';
+  LOCS.forEach(loc=>{ const t=days.reduce((s,d)=>s+(d.rec[loc]||0),0); csv+=`${LABELS[loc]},${fmtH(t)}\n`; });
+  const blob=new Blob([csv],{type:'text/csv'});
+  const a=Object.assign(document.createElement('a'),{href:URL.createObjectURL(blob),download:`location-log-${isoDate(new Date())}.csv`});
+  a.click(); URL.revokeObjectURL(a.href);
+  toast('CSV exported ✓');
+};
+
+// ════════════════════════════════════════════════════════════
+//  ADMIN
+// ════════════════════════════════════════════════════════════
+window.addUser = async function(){
+  const name=document.getElementById('nu-name').value.trim(),email=document.getElementById('nu-email').value.trim(),pw=document.getElementById('nu-pw').value,role=document.getElementById('nu-role').value;
+  if(!name||!email||!pw){ toast('Fill in all fields'); return; } if(pw.length<6){ toast('Password min 6 chars'); return; }
+  try{ const sa=initializeApp(fbConfig,'sec-'+Date.now()); const sa2=getAuth(sa); const cred=await createUserWithEmailAndPassword(sa2,email,pw); await updateProfile(cred.user,{displayName:name}); await set(ref(db,`users/${cred.user.uid}`),{name,email,role,createdAt:Date.now()}); await signOut(sa2); document.getElementById('nu-name').value=''; document.getElementById('nu-email').value=''; document.getElementById('nu-pw').value=''; toast(`${name} added ✓`); loadAdminUsers(); }
+  catch(e){ toast('Error: '+(e.message.includes('email-already-in-use')?'Email already registered':e.message)); }
+};
+async function loadAdminUsers(){ if(currentRole!=='admin') return; const snap=await get(ref(db,'users')); const tbody=document.getElementById('users-tbody'); tbody.innerHTML=''; if(!snap.exists()){ tbody.innerHTML='<tr><td colspan="4" style="color:var(--muted);font-size:12px;padding:12px">No users</td></tr>'; return; } const users=snap.val(); document.getElementById('user-count-badge').textContent=`${Object.keys(users).length} users`; Object.entries(users).forEach(([uid,u])=>{ const isSelf=uid===currentUser.uid; const tr=document.createElement('tr'); tr.innerHTML=`<td>${u.name||'—'}</td><td style="font-family:'JetBrains Mono',monospace;font-size:12px">${u.email}</td><td><span class="role-badge ${u.role||'user'}">${u.role||'user'}</span></td><td>${isSelf?'<span style="font-size:11px;color:var(--muted)">(you)</span>':`<button class="btn-icon" onclick="removeUser('${uid}','${u.name||u.email}')">🗑</button>`}</td>`; tbody.appendChild(tr); }); }
+window.removeUser=async function(uid,name){ if(!confirm(`Remove "${name}"?`)) return; await remove(ref(db,`users/${uid}`)); toast(`${name} removed`); loadAdminUsers(); };
+window.saveGlobalSetting=async function(key,val){ globalSettings[key]=val; await update(ref(db,'globalSettings'),{[key]:val}); updateGHint(); document.getElementById('maxh-lbl').textContent=maxH(); buildBulkHourChips(); };
+function updateGHint(){ const s=globalSettings.workStart,e=globalSettings.workEnd; const fmt=h=>`${h>12?h-12:h}:00 ${h>=12?'pm':'am'}`; document.getElementById('g-hours-hint').textContent=`Work day: ${fmt(s)} – ${fmt(e)} · ${e-s} hrs/day`; }
+
+// ════════════════════════════════════════════════════════════
+//  SETTINGS
+// ════════════════════════════════════════════════════════════
+window.updateDisplayName=async function(name){ if(!name.trim()) return; try{ await updateProfile(currentUser,{displayName:name}); const ini=name.split(' ').map(n=>n[0]).join('').toUpperCase().slice(0,2); document.getElementById('user-avatar').textContent=ini; document.getElementById('user-display-name').textContent=name; await update(ref(db,`users/${currentUser.uid}`),{name}); } catch{} };
+window.changePassword=async function(){ const pw=document.getElementById('s-newpw').value; if(!pw||pw.length<6){ toast('Enter min 6 chars'); return; } try{ await updatePassword(currentUser,pw); toast('Password updated ✓'); document.getElementById('s-newpw').value=''; } catch(e){ toast('Error: '+e.message); } };
+window.exportData=function(){ const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'}); const a=Object.assign(document.createElement('a'),{href:URL.createObjectURL(blob),download:`wlt-${isoDate(new Date())}.json`}); a.click(); URL.revokeObjectURL(a.href); toast('Exported ✓'); };
+
+// ════════════════════════════════════════════════════════════
+//  TABS & USER MENU
+// ════════════════════════════════════════════════════════════
+window.switchTab=function(name,btn){ document.querySelectorAll('.tab-pane').forEach(p=>p.classList.remove('active')); document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active')); document.getElementById('pane-'+name).classList.add('active'); if(btn) btn.classList.add('active'); document.getElementById('week-ctrl').style.display=(name==='tracker')?'flex':'none'; if(name==='admin') loadAdminUsers(); };
+window.toggleUserMenu=function(){ document.getElementById('user-menu').classList.toggle('open'); };
+window.closeUserMenu=function(){ document.getElementById('user-menu').classList.remove('open'); };
+document.addEventListener('click',e=>{ if(!e.target.closest('.user-menu-wrap')) closeUserMenu(); });
+
+// ════════════════════════════════════════════════════════════
+//  BOOT
+// ════════════════════════════════════════════════════════════
+loadColours();
+initFirebase();
+</script>
